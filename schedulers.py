@@ -52,7 +52,7 @@ class WarmupStableDecay:
             progress_into_cooldown = (step - (self.max_steps - self.warmdown_steps) + 1) / self.warmdown_steps
             return 0.1 + 0.9 * (1 - math.sqrt(progress_into_cooldown))
 
-def get_schedulers(config, muon_optimizer, adamw_optimizer):
+def get_schedulers(config, optimizer):
     lr_lambda = WarmupStableDecay(
         warmup_steps=config["warmup_steps"],
         max_steps=config["max_steps"],
@@ -60,8 +60,5 @@ def get_schedulers(config, muon_optimizer, adamw_optimizer):
         mode=config["sched_mode"],
     )
 
-    schedulers = [
-        torch.optim.lr_scheduler.LambdaLR(muon_optimizer, lr_lambda=lr_lambda),
-        torch.optim.lr_scheduler.LambdaLR(adamw_optimizer, lr_lambda=lr_lambda),
-    ]
-    return schedulers
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    return scheduler

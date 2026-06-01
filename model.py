@@ -103,20 +103,55 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
-        dim = config.n_embd // config.n_head
-        max_seq_len = config.block_size
-        base = config.rope_theta
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))
-        freq = torch.outer(torch.arange(max_seq_len), inv_freq)
-        self.register_buffer("sin", freq.sin()[None, None])
-        self.register_buffer("cos", freq.cos()[None, None])
+        self.head_dim = config.n_embd // config.n_head
+        assert self.head_dim % 2 == 0, "RoPE requires even head_dim"
 
-    def forward(self, x, offset=0):
-        T = x.size(-2)
-        sin = self.sin[:, :, offset:offset + T]
-        cos = self.cos[:, :, offset:offset + T]
-        x1, x2 = x[..., 0::2], x[..., 1::2]
-        return torch.stack([cos * x1 - sin * x2, sin * x1 + cos * x2], dim=-1).flatten(-2)
+        inv_freq = 1.0 / (
+            config.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def _build_cache(self, seq_len, device, dtype):
+        if (
+            self.cos_cached is not None
+            and self.cos_cached.size(-2) >= seq_len
+            and self.cos_cached.device == device
+            and self.cos_cached.dtype == dtype
+        ):
+            return
+
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos()[None, None, :, :]
+        sin = emb.sin()[None, None, :, :]
+        self.cos_cached = cos.to(dtype=dtype)
+        self.sin_cached = sin.to(dtype=dtype)
+
+    def _rotate_half(self, x):
+        x = x.view(*x.shape[:-1], 2, x.shape[-1] // 2)
+        x1, x2 = x.unbind(-2)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rotary(self, x, cos, sin):
+        return (x * cos) + (self._rotate_half(x) * sin)
+
+    def forward(self, q, k, pos_offset=0):
+        device = q.device
+        dtype = q.dtype
+        T = q.size(-2)
+        total_len = pos_offset + T
+
+        self._build_cache(total_len, device, dtype)
+        cos = self.cos_cached[..., pos_offset:pos_offset + T, :]
+        sin = self.sin_cached[..., pos_offset:pos_offset + T, :]
+
+        q = self._apply_rotary(q, cos, sin)
+        k = self._apply_rotary(k, cos, sin)
+        return q, k
 
 
 class MultiHeadAttention(nn.Module):
@@ -213,8 +248,7 @@ class MultiHeadAttention(nn.Module):
         else:
             pos_offset = 0
         
-        q = self.rope(q, offset=pos_offset)
-        k = self.rope(k, offset=pos_offset)
+        q, k = self.rope(q, k, pos_offset=pos_offset)
         
         if past_kv is not None:
             k = torch.cat([past_k, k], dim=2)
