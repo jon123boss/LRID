@@ -20,25 +20,27 @@ class OptimizerConfig:
 def configure_optimizers(model, config: OptimizerConfig):
     muon_params = []
     adamw_params = []
+    core_model = getattr(model, "_orig_mod", model)
     
-    if hasattr(model, "transformer") and hasattr(model.transformer, "layers"):
-        for layer_idx, block in enumerate(model.transformer.layers):
-            for name, p in block.named_parameters():
-                if p.ndim >= 2:
-                    muon_params.append(p)
-                else:
-                    adamw_params.append(p)
+    if hasattr(core_model, "transformer"):
+        for name, p in core_model.transformer.named_parameters():
+            if name.startswith("wte.") or name.startswith("final_norm."):
+                continue
+            if p.ndim >= 2:
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
 
-    if hasattr(model.transformer, "wte"):
-        for p in model.transformer.wte.parameters():
+    if hasattr(core_model.transformer, "wte"):
+        for p in core_model.transformer.wte.parameters():
             adamw_params.append(p)
     
-    if hasattr(model, "lm_head") and model.lm_head is not None:
-        for p in model.lm_head.parameters():
+    if hasattr(core_model, "lm_head") and core_model.lm_head is not None:
+        for p in core_model.lm_head.parameters():
             adamw_params.append(p)
     
-    if hasattr(model.transformer, "final_norm"):
-        for p in model.transformer.final_norm.parameters():
+    if hasattr(core_model.transformer, "final_norm"):
+        for p in core_model.transformer.final_norm.parameters():
             if p.ndim < 2: 
                 adamw_params.append(p)
     

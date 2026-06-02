@@ -36,6 +36,8 @@ def get_model(config, device):
         print(f"Resuming from {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=device)
         ckpt_model_args = checkpoint["model_args"]
+        if "attn_res_type" in ckpt_model_args and "attnres_type" not in ckpt_model_args:
+            ckpt_model_args["attnres_type"] = ckpt_model_args["attn_res_type"]
         model_config = ModelConfig(**ckpt_model_args)
         model = OBPM(model_config)
         model_state_dict = checkpoint['model']

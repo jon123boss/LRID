@@ -9,6 +9,7 @@ import time
 import tiktoken
 import os, sys
 import copy
+import argparse
 import numpy as np
 from utils import get_config, get_device, get_model, get_dataloader
 from criterion import get_criterion
@@ -70,9 +71,9 @@ flash_attention = True
 init_std = 0.02
 init_cutoff_factor = None
 # Attention Residuals
-use_attnres = True
-attnres_type = "full" # "full" or "block"
-attnres_num_blocks = 2
+use_attnres = False
+attnres_type = "block" # "full" or "block"
+attnres_num_blocks = 8
 # rope
 rope_theta = 500000.0
 # normalization
@@ -110,6 +111,32 @@ warmdown_steps = int(0.2 * max_steps)
 sched_mode = "linear"
 
 # -----------------------------------------------------------------------------
+
+def _str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train OBPM.")
+    parser.add_argument("--use_attnres", type=_str_to_bool, nargs="?", const=True, default=use_attnres)
+    parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
+    parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
+    parser.add_argument("--attnres_num_blocks", type=int, default=attnres_num_blocks)
+    return parser.parse_args()
+
+
+args = parse_args()
+use_attnres = args.use_attnres
+attnres_type = args.attnres_type
+attnres_num_blocks = args.attnres_num_blocks
+
 config = get_config(sys.modules[__name__].__dict__)
 start_step, checkpoint, model, model_config = get_model(config, device)
 model.to_mixed_precision(dtype=torch.bfloat16)

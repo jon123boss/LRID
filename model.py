@@ -26,9 +26,16 @@ class ModelConfig:
     flash_attention: bool = False
     init_std: float = 0.02
     init_cutoff_factor: float = None
-    attn_res_type: str = None
+    attnres_type: str = None
     use_attnres: bool = False
-    attnres_num_blocks: int = 0
+    attnres_num_blocks: int = 8
+    attn_res_type: str = None
+
+    def __post_init__(self):
+        # Backward compatibility for early configs/checkpoints that used the
+        # underscored field name before the train.py toggle was wired up.
+        self.attnres_type = self.attnres_type or self.attn_res_type or "block"
+        self.attnres_type = self.attnres_type.lower()
 
 class RMSNorm(nn.Module):
     def __init__(self, config, dim=None):
@@ -211,6 +218,20 @@ class MLP(nn.Module):
         x = self.fc2(x)
         return x
 
+
+class AttentionResidual(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.norm = RMSNorm(config)
+        self.query = nn.Parameter(torch.empty(config.n_embd))
+
+    def forward(self, values):
+        keys = self.norm(values)
+        logits = torch.einsum("d,sbtd->sbt", self.query.to(keys.dtype), keys)
+        weights = F.softmax(logits, dim=0).to(values.dtype)
+        return torch.einsum("sbt,sbtd->btd", weights, values)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx=0):
         super().__init__()
@@ -222,37 +243,61 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
         self.config = config
 
-    def forward(self, x, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
-        residual = x
-        
+    def forward_attention(self, x, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
         if self.norm_pos in {"before", "both"}:
             x = self.attn_norm(x)
-        
+
         attn_out = self.attn(x, past_kv=past_kv, use_cache=use_cache, cu_doc_len=cu_doc_len, max_doc_len=max_doc_len)
-        
+
         if use_cache:
             x, new_kv = attn_out
         else:
             x = attn_out
             new_kv = None
-        
+
         if self.norm_pos in {"after", "both"}:
             x = self.attn_norm(x)
-        
-        x = residual + x
-        
-        residual = x
-        
+
+        if use_cache:
+            return x, new_kv
+        return x
+
+    def forward_mlp(self, x):
         if self.norm_pos in {"before", "both"}:
             x = self.mlp_norm(x)
-        
+
         x = self.mlp(x)
-        
+
         if self.norm_pos in {"after", "both"}:
             x = self.mlp_norm(x)
-        
+
+        return x
+
+    def forward(self, x, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
+        residual = x
+
+        attn_out = self.forward_attention(
+            x,
+            past_kv=past_kv,
+            use_cache=use_cache,
+            cu_doc_len=cu_doc_len,
+            max_doc_len=max_doc_len,
+        )
+
+        if use_cache:
+            x, new_kv = attn_out
+        else:
+            x = attn_out
+            new_kv = None
+
         x = residual + x
-        
+
+        residual = x
+
+        x = self.forward_mlp(x)
+
+        x = residual + x
+
         if use_cache:
             return x, new_kv
         else:
@@ -263,15 +308,28 @@ class OBPM(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.use_attnres = config.use_attnres
+        self.attnres_type = config.attnres_type
         
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         
-        self.transformer = nn.ModuleDict(dict(
+        transformer_modules = dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             layers=nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
             final_norm=RMSNorm(config)
-        ))
+        )
+
+        if self.use_attnres:
+            if self.attnres_type not in {"full", "block"}:
+                raise ValueError("attnres_type must be 'full' or 'block'")
+            if self.attnres_type == "block" and config.attnres_num_blocks < 1:
+                raise ValueError("attnres_num_blocks must be >= 1 when using block AttnRes")
+            transformer_modules["attn_residuals"] = nn.ModuleList(
+                [AttentionResidual(config) for _ in range(2 * config.n_layer + 1)]
+            )
+
+        self.transformer = nn.ModuleDict(transformer_modules)
         
         if not config.weight_tying:
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -284,6 +342,15 @@ class OBPM(nn.Module):
     
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
+
+    def _attnres_block_size(self):
+        if not self.use_attnres or self.attnres_type != "block":
+            return None
+        return math.ceil((2 * self.config.n_layer) / self.config.attnres_num_blocks)
+
+    def _apply_attnres(self, residual_idx, sources):
+        values = torch.stack(sources, dim=0)
+        return self.transformer.attn_residuals[residual_idx](values)
     
     def _init_weights(self, module, std=0.02, init_cutoff_factor=None):
         if isinstance(module, nn.Linear):
@@ -298,31 +365,93 @@ class OBPM(nn.Module):
                 nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-cutoff, b=cutoff)
             else:
                 nn.init.normal_(module.weight, mean=0.0, std=std)
+        elif isinstance(module, AttentionResidual):
+            if init_cutoff_factor is not None:
+                cutoff = init_cutoff_factor * std
+                nn.init.trunc_normal_(module.query, mean=0.0, std=std, a=-cutoff, b=cutoff)
+            else:
+                nn.init.normal_(module.query, mean=0.0, std=std)
     
     def forward(self, idx, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
-        B, T = idx.size()
+        _, T = idx.size()
         assert T <= self.config.block_size, f"Token length {T} exceeds max sequence length {self.config.block_size}"
         
         x = self.transformer.wte(idx)
+        if self.use_attnres:
+            if past_kv is not None or use_cache:
+                raise NotImplementedError("KV-cache generation is not supported with attention residuals yet.")
+            embedding = x
+            if self.attnres_type == "full":
+                residual_sources = [embedding]
+            else:
+                block_size = self._attnres_block_size()
+                completed_blocks = [embedding]
+                partial_block = None
         
         if past_kv is None:
             past_kv = [None] * len(self.transformer.layers)
         new_kv = [] if use_cache else None
         
         for layer_idx, block in enumerate(self.transformer.layers):
-            block_out = block(
-                x,
-                past_kv=past_kv[layer_idx],
-                use_cache=use_cache,
-                cu_doc_len=cu_doc_len,
-                max_doc_len=max_doc_len,
-            )
-            
-            if use_cache:
-                x, present_kv = block_out
-                new_kv.append(present_kv)
+            if self.use_attnres:
+                if self.attnres_type == "full":
+                    x = self._apply_attnres(2 * layer_idx, residual_sources)
+                else:
+                    attn_res_idx = 2 * layer_idx
+                    in_block_idx = attn_res_idx % block_size
+                    sources = completed_blocks if in_block_idx == 0 else completed_blocks + [partial_block]
+                    x = self._apply_attnres(2 * layer_idx, sources)
+
+                attn_out = block.forward_attention(
+                    x,
+                    past_kv=past_kv[layer_idx],
+                    use_cache=False,
+                    cu_doc_len=cu_doc_len,
+                    max_doc_len=max_doc_len,
+                )
+                layer_output = attn_out
+
+                if self.attnres_type == "full":
+                    residual_sources.append(layer_output)
+                    x = self._apply_attnres(2 * layer_idx + 1, residual_sources)
+                else:
+                    partial_block = layer_output if partial_block is None else partial_block + layer_output
+                    sources = completed_blocks if (2 * layer_idx + 1) % block_size == 0 else completed_blocks + [partial_block]
+                    x = self._apply_attnres(2 * layer_idx + 1, sources)
+
+                mlp_out = block.forward_mlp(x)
+                layer_output = mlp_out
+                x = mlp_out
+
+                if self.attnres_type == "full":
+                    residual_sources.append(layer_output)
+                else:
+                    partial_block = layer_output if partial_block is None else partial_block + layer_output
+                    is_block_end = ((2 * layer_idx + 2) % block_size == 0) or (layer_idx + 1 == self.config.n_layer)
+                    if is_block_end:
+                        completed_blocks.append(partial_block)
+                        partial_block = None
             else:
-                x = block_out
+                block_out = block(
+                    x,
+                    past_kv=past_kv[layer_idx],
+                    use_cache=use_cache,
+                    cu_doc_len=cu_doc_len,
+                    max_doc_len=max_doc_len,
+                )
+
+                if use_cache:
+                    x, present_kv = block_out
+                    new_kv.append(present_kv)
+                else:
+                    x = block_out
+
+        if self.use_attnres:
+            if self.attnres_type == "full":
+                x = self._apply_attnres(2 * self.config.n_layer, residual_sources)
+            else:
+                sources = completed_blocks if partial_block is None else completed_blocks + [partial_block]
+                x = self._apply_attnres(2 * self.config.n_layer, sources)
         
         x = self.transformer.final_norm(x)
         
@@ -340,7 +469,7 @@ class OBPM(nn.Module):
         self.eval()
         device = next(self.parameters()).device
         idx = idx.to(device)
-        B, T = idx.size()
+        _, T = idx.size()
 
         if max_context is None:
             max_context = self.config.block_size
