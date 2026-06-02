@@ -44,13 +44,13 @@ init_from = 'scratch'
 ckpt_file_name = ''
 # wandb logging
 wandb_log = True
-wandb_project = ""
-wandb_run_name = ""
+wandb_project = "LRID"
+wandb_run_name = "Full Attnres"
 # data
 dataset_dir = "finewebedu10B"
-batch_size = 16
+batch_size = 32
 block_size = 2048
-grad_accum_steps = 8
+grad_accum_steps = 4
 total_batch_size = batch_size * block_size * grad_accum_steps
 # Document masking (Dataloader)
 use_doc_masking = True
@@ -80,14 +80,14 @@ qk_norm = True
 norm_pos = "before" # before, after, both
 clip_qkv = None
 # Attention Residuals (AttnRes)
-use_attnres = False
-attnres_mode = "block"  # "full" or "block"
-attnres_num_blocks = 6  # N blocks for block mode (N≈8 in paper); full mode ignores this
-track_attnres = False   # Track and log AttnRes attention weights to wandb
+use_attnres = True
+attnres_mode = "full"  # "full" ofullock"
+attnres_num_blocks = 6  # N blocks for block mode (N ^i^h8 in paper); full mode ignores this
+track_attnres = True   # Track and log AttnRes attentTrue eights to wandb
 # optimizer (Muon + AdamW settings)
 muon_lr = 0.01
 adamw_lr= 0.003
-max_steps = 38147
+max_steps = 1000
 max_tokens = int(10e9)
 muon_weight_decay = 0.1
 adamw_weight_decay = 0.0
@@ -107,7 +107,7 @@ reduction = "mean"
 z_loss = True
 z_loss_weight = 1e-5
 # Scheduler
-warmup_steps = 1000
+warmup_steps = 100
 warmdown_steps = int(0.2 * max_steps)
 sched_mode = "linear"
 
@@ -151,7 +151,7 @@ if use_doc_masking:
     warmup_boundaries(train_loader.dataset)
     warmup_boundaries(val_loader.dataset)
     print("Boundary warmup complete.")
-    
+
 tokens_processed = 0
 tokens_per_step = batch_size * block_size * grad_accum_steps
 if checkpoint is not None:
@@ -160,7 +160,7 @@ if checkpoint is not None:
     muon_scheduler.load_state_dict(checkpoint["muon_scheduler"])
     adamw_scheduler.load_state_dict(checkpoint["adamw_scheduler"])
     tokens_processed = int(checkpoint["tokens_processed"])
-    
+
 print(f"Tokens per step: {tokens_per_step:,}")
 print(f"Starting from step {start_step}, tokens seen: {tokens_processed:,}")
 
@@ -226,7 +226,7 @@ train_iter = infinite_dataloader(train_loader)
 
 while tokens_processed < max_tokens and step < max_steps:
     muon_optimizer.param_groups[0]['momentum'] = get_muon_momentum(step)
-    
+
     if step != 0 and (step % eval_interval == 0 or step == max_steps - 1):
         losses = estimate_loss(step)
         print(f"Eval: Step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -267,12 +267,12 @@ while tokens_processed < max_tokens and step < max_steps:
             print(f"Saved checkpoint: {ckpt_path}")
             if wandb_log:
                 logger.log_checkpoint(step, ckpt_path, config=config)
-    
+
     model.train()
     t0 = time.time()
-    
+
     for opt in optimizers: opt.zero_grad(set_to_none=True)
-    
+
     loss_accum = 0.0
     attnres_weights = None
     for micro_step in range(grad_accum_steps):
@@ -305,32 +305,32 @@ while tokens_processed < max_tokens and step < max_steps:
             attnres_weights = model.get_attnres_weights()
 
         loss.backward()
-    
+
     if grad_clip > 0.0: norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     else: norm = None
-    
+
     for opt in optimizers: opt.step()
     for sched in schedulers: sched.step()
-    
+
     tokens_processed += tokens_per_step
-    
+
     if device == "cuda": torch.cuda.synchronize()
     t1 = time.time()
-    
+
     tokens_per_s = tokens_per_step / (t1 - t0)
     ms_per_step = (t1 - t0) * 1000.0
 
     if wandb_log:
         logger.log_train(
-            step, loss_accum, norm, 
-            muon_scheduler.get_last_lr()[0], 
+            step, loss_accum, norm,
+            muon_scheduler.get_last_lr()[0],
             ms_per_step, tokens_per_s, tokens_processed
         )
-        
+
         # Log AttnRes attention weights if tracking is enabled
         if use_attnres and track_attnres and attnres_weights is not None:
             logger.log_attnres_weights(step, attnres_weights, tokens_processed)
-        
+
     if step % log_interval == 0:
         print(
             f"Step {step}, "
@@ -342,7 +342,7 @@ while tokens_processed < max_tokens and step < max_steps:
             f"Muon LR: {muon_scheduler.get_last_lr()[0]:.6f}, "
             f"AdamW LR: {adamw_scheduler.get_last_lr()[0]:.6f}"
         )
-    
+
     step += 1
 
 print("=" * 80)
