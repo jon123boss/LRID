@@ -69,10 +69,6 @@ def get_model(config, device):
             flash_attention=config["flash_attention"],
             init_std=config["init_std"],
             init_cutoff_factor=config["init_cutoff_factor"],
-            use_attnres=config.get("use_attnres", False),
-            attnres_mode=config.get("attnres_mode", "block"),
-            attnres_num_blocks=config.get("attnres_num_blocks", 6),
-            track_attnres=config.get("track_attnres", False),
             )
         model = OBPM(model_config)
     else:

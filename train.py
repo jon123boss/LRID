@@ -45,7 +45,7 @@ ckpt_file_name = ''
 # wandb logging
 wandb_log = True
 wandb_project = "LRID"
-wandb_run_name = "Full Attnres"
+wandb_run_name = "LRID"
 # data
 dataset_dir = "finewebedu10B"
 batch_size = 32
@@ -79,11 +79,6 @@ rmsnorm_use_bias = False
 qk_norm = True
 norm_pos = "before" # before, after, both
 clip_qkv = None
-# Attention Residuals (AttnRes)
-use_attnres = True
-attnres_mode = "full"  # "full" ofullock"
-attnres_num_blocks = 6  # N blocks for block mode (N ^i^h8 in paper); full mode ignores this
-track_attnres = True   # Track and log AttnRes attentTrue eights to wandb
 # optimizer (Muon + AdamW settings)
 muon_lr = 0.01
 adamw_lr= 0.003
@@ -173,7 +168,6 @@ def infinite_dataloader(dataloader):
 @torch.no_grad()
 def estimate_loss(current_step):
     out = {}
-    val_attnres_weights = None
     model.eval()
 
     for split, loader in [("train", train_loader), ("val", val_loader)]:
@@ -208,12 +202,8 @@ def estimate_loss(current_step):
 
             losses[k] = float(loss.item())
 
-            # Collect AttnRes weights from last val batch for logging
-            if split == "val" and use_attnres and track_attnres and wandb_log and k == eval_steps - 1:
-                val_attnres_weights = model.get_attnres_weights()
         out[split] = losses.mean()
     model.train()
-    out["val_attnres_weights"] = val_attnres_weights
     return out
 
 step = start_step
@@ -231,18 +221,12 @@ while tokens_processed < max_tokens and step < max_steps:
         losses = estimate_loss(step)
         print(f"Eval: Step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            val_attnres_dict = None
-            if use_attnres and track_attnres and "val_attnres_weights" in losses:
-                val_weights = losses["val_attnres_weights"]
-                if val_weights is not None:
-                    val_attnres_dict = {f"val/{k}": v for k, v in val_weights.items()}
             logger.log_eval(
                 step,
                 float(losses["train"]),
                 float(losses["val"]),
                 muon_scheduler.get_last_lr()[0],
                 tokens_processed,
-                val_attnres_dict=val_attnres_dict
             )
         if eval_only:
             break
@@ -273,7 +257,6 @@ while tokens_processed < max_tokens and step < max_steps:
     for opt in optimizers: opt.zero_grad(set_to_none=True)
 
     loss_accum = 0.0
-    attnres_weights = None
     for micro_step in range(grad_accum_steps):
         batch = next(train_iter)
 
@@ -299,10 +282,6 @@ while tokens_processed < max_tokens and step < max_steps:
 
         loss_accum += loss.detach().item()
 
-        # Collect AttnRes attention weights from the last micro-step for logging
-        if use_attnres and track_attnres and wandb_log and micro_step == grad_accum_steps - 1:
-            attnres_weights = model.get_attnres_weights()
-
         loss.backward()
 
     if grad_clip > 0.0: norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -324,7 +303,6 @@ while tokens_processed < max_tokens and step < max_steps:
             step, loss_accum, norm,
             muon_scheduler.get_last_lr()[0],
             ms_per_step, tokens_per_s, tokens_processed,
-            attnres_dict=attnres_weights
         )
 
     if step % log_interval == 0:

@@ -27,11 +27,6 @@ class ModelConfig:
     flash_attention: bool = False
     init_std: float = 0.02
     init_cutoff_factor: float = None
-    use_attnres: bool = False
-    attnres_mode: str = "block"
-    attnres_num_blocks: int = 6
-    track_attnres: bool = False
-
 
 class ActivationFunction(nn.Module):
     def __init__(self, act_type):
@@ -254,48 +249,6 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
         self.config = config
 
-        if config.use_attnres:
-            # Zero-initialized pseudo-query vectors (paper: "Crucially, all pseudo-query
-            # vectors must be initialized to zero" to ensure uniform attention at start)
-            self.attn_res_query = nn.Parameter(torch.zeros(config.n_embd))
-            self.mlp_res_query = nn.Parameter(torch.zeros(config.n_embd))
-            # RMSNorm on keys to prevent magnitude differences from biasing softmax
-            self.attn_res_norm = RMSNorm(config)
-            self.mlp_res_norm = RMSNorm(config)
-
-    def _compute_attnres(self, blocks, partial_block, query, norm, tracker=None, layer_idx=None, sublayer="attn"):
-        """
-        Compute Attention Residual (AttnRes) over block representations.
-        blocks: list of [B, T, D] tensors (completed block reps + embedding b_0)
-        partial_block: [B, T, D] or None (intra-block partial sum b_n^{i-1})
-        query: [D] learned pseudo-query vector
-        norm: RMSNorm applied to keys
-        tracker: optional list to store tracked attention weights
-        layer_idx: layer index for tracking
-        sublayer: "attn" or "mlp" for tracking
-        Returns: [B, T, D] AttnRes output
-        """
-        if partial_block is None:
-            V = torch.stack(blocks)  # [N, B, T, D]
-        else:
-            V = torch.stack(blocks + [partial_block])  # [N+1, B, T, D]
-        K = norm(V)
-        logits = torch.einsum("d, n b t d -> n b t", query, K)
-        weights = logits.softmax(0)
-        h = torch.einsum("n b t, n b t d -> b t d", weights, V)
-        
-        if tracker is not None:
-            # Store detached mean weights: [num_sources] averaged over batch and sequence
-            with torch.no_grad():
-                tracker.append({
-                    "layer_idx": layer_idx,
-                    "sublayer": sublayer,
-                    "weights": weights.mean(dim=(1, 2)).detach().cpu(),  # [num_sources]
-                    "num_sources": weights.size(0),
-                })
-        
-        return h
-
     def forward(self, x, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
         residual = x
         
@@ -389,105 +342,20 @@ class OBPM(nn.Module):
             past_kv = [None] * len(self.transformer.layers)
         new_kv = [] if use_cache else None
         
-        if not self.config.use_attnres:
-            # Standard residual path
-            for layer_idx, block in enumerate(self.transformer.layers):
-                block_out = block(
-                    x,
-                    past_kv=past_kv[layer_idx],
-                    use_cache=use_cache,
-                    cu_doc_len=cu_doc_len,
-                    max_doc_len=max_doc_len,
-                )
-                
-                if use_cache:
-                    x, present_kv = block_out
-                    new_kv.append(present_kv)
-                else:
-                    x = block_out
-        else:
-            # Attention Residuals (AttnRes) path
-            # Follows paper Fig. 2 pseudocode exactly.
-            # blocks already includes token embedding as b_0.
-            blocks = [x]
-            partial_block = None
-
-            # Tracking buffer for attention weights
-            attnres_tracker = [] if self.config.track_attnres else None
-
-            # Compute block boundaries (Transformer layer indices where new blocks start)
-            if self.config.attnres_mode == "block":
-                total_layers = self.config.n_layer
-                num_blocks = self.config.attnres_num_blocks
-                base = total_layers // num_blocks
-                rem = total_layers % num_blocks
-                block_sizes = [base + 1] * rem + [base] * (num_blocks - rem)
-                block_starts = set()
-                cumsum = 0
-                for size in block_sizes:
-                    if cumsum > 0:
-                        block_starts.add(cumsum)
-                    cumsum += size
+        for layer_idx, block in enumerate(self.transformer.layers):
+            block_out = block(
+                x,
+                past_kv=past_kv[layer_idx],
+                use_cache=use_cache,
+                cu_doc_len=cu_doc_len,
+                max_doc_len=max_doc_len,
+            )
+            
+            if use_cache:
+                x, present_kv = block_out
+                new_kv.append(present_kv)
             else:
-                # Full mode: every layer after 0 starts a new block
-                block_starts = set(range(1, self.config.n_layer))
-            
-            for layer_idx, block in enumerate(self.transformer.layers):
-                # ---- Attention sub-layer ----
-                # Compute AttnRes input BEFORE boundary check (as in pseudocode)
-                h = block._compute_attnres(
-                    blocks, partial_block,
-                    block.attn_res_query, block.attn_res_norm,
-                    tracker=attnres_tracker, layer_idx=layer_idx, sublayer="attn"
-                )
-                
-                # If reaches block boundary, start new block
-                if layer_idx in block_starts:
-                    blocks.append(partial_block)
-                    partial_block = None
-                
-                if block.norm_pos in {"before", "both"}:
-                    h = block.attn_norm(h)
-                
-                attn_out = block.attn(
-                    h,
-                    past_kv=past_kv[layer_idx],
-                    use_cache=use_cache,
-                    cu_doc_len=cu_doc_len,
-                    max_doc_len=max_doc_len,
-                )
-                
-                if use_cache:
-                    attn_out, present_kv = attn_out
-                    new_kv.append(present_kv)
-                
-                if block.norm_pos in {"after", "both"}:
-                    attn_out = block.attn_norm(attn_out)
-                
-                partial_block = attn_out if partial_block is None else partial_block + attn_out
-                
-                # ---- MLP sub-layer ----
-                h = block._compute_attnres(
-                    blocks, partial_block,
-                    block.mlp_res_query, block.mlp_res_norm,
-                    tracker=attnres_tracker, layer_idx=layer_idx, sublayer="mlp"
-                )
-                
-                if block.norm_pos in {"before", "both"}:
-                    h = block.mlp_norm(h)
-                
-                mlp_out = block.mlp(h)
-                
-                if block.norm_pos in {"after", "both"}:
-                    mlp_out = block.mlp_norm(mlp_out)
-                
-                partial_block = partial_block + mlp_out
-            
-            x = partial_block
-            
-            # Store tracker on model for external access
-            if attnres_tracker is not None:
-                self._last_attnres_tracker = attnres_tracker
+                x = block_out
         
         x = self.transformer.final_norm(x)
         
@@ -499,26 +367,6 @@ class OBPM(nn.Module):
         if use_cache:
             return logits, new_kv
         return logits
-    
-    def get_attnres_weights(self):
-        """
-        Retrieve tracked AttnRes attention weights from the last forward pass.
-        Returns a dict mapping wandb-friendly keys to weight values, or None if not tracking.
-        Format: {"attnres/layer_{l}_{sublayer}/source_{s}": weight, ...}
-        """
-        if not hasattr(self, "_last_attnres_tracker") or self._last_attnres_tracker is None:
-            return None
-        
-        result = {}
-        for entry in self._last_attnres_tracker:
-            layer_idx = entry["layer_idx"]
-            sublayer = entry["sublayer"]
-            weights = entry["weights"]  # [num_sources]
-            for src_idx in range(weights.size(0)):
-                key = f"attnres/layer_{layer_idx}_{sublayer}/source_{src_idx}"
-                result[key] = weights[src_idx].item()
-        
-        return result
     
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, max_context=None):
