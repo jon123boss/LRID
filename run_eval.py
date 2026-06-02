@@ -98,7 +98,7 @@ class OBPMWrapper(LM):
         self.model.to(self._device)
         self.model.eval()
 
-        if hasattr(self.model, "to_mixed_precision"):
+        if self._device.type == "cuda" and hasattr(self.model, "to_mixed_precision"):
             self.model.to_mixed_precision(dtype=torch.bfloat16)
 
         self.tokenizer = tiktoken.get_encoding("gpt2")
@@ -216,11 +216,8 @@ class OBPMWrapper(LM):
 
             x = torch.tensor([tokens], dtype=torch.long, device=self._device)
 
-            with torch.no_grad():
-                try:
-                    out_idx = self.model.generate(x, max_new_tokens=max_gen_toks, temperature=0.0)
-                except TypeError:
-                    out_idx = self.model.generate(x, max_new_tokens=max_gen_toks)
+            with torch.inference_mode():
+                out_idx = self.model.generate(x, max_new_tokens=max_gen_toks, temperature=0.0)
 
             out = out_idx[0].tolist()
             new_tokens = out[len(x[0]) :]

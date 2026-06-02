@@ -23,11 +23,9 @@ class CrossEntropyLoss(nn.Module):
 
         if flash_attention:
             try:
-                import flash_attn  # type: ignore
                 from flash_attn.ops.triton.cross_entropy import (  # type: ignore
                     cross_entropy_loss as flash_cross_entropy_loss,
                 )
-                from packaging import version
 
                 self._flash_ce = flash_cross_entropy_loss
 

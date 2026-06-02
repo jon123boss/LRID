@@ -187,6 +187,12 @@ class MultiHeadAttention(nn.Module):
                 causal=is_causal,
             )
             return x.view(B, T, H, D).contiguous().view(B, T, self.n_embd)
+
+        elif cu_doc_len is not None or max_doc_len is not None:
+            raise RuntimeError(
+                "Document masking requires flash-attn varlen support. "
+                "Install flash-attn or disable use_doc_masking."
+            )
         
         elif MultiHeadAttention.flash_attn_func is not None and attn_mask is None:
             x = MultiHeadAttention.flash_attn_func(
@@ -464,11 +470,26 @@ class OBPM(nn.Module):
             else:
                 nn.init.normal_(module.weight, mean=0.0, std=std)
         elif isinstance(module, AttentionResidual):
-            if init_cutoff_factor is not None:
-                cutoff = init_cutoff_factor * std
-                nn.init.trunc_normal_(module.query, mean=0.0, std=std, a=-cutoff, b=cutoff)
-            else:
-                nn.init.normal_(module.query, mean=0.0, std=std)
+            nn.init.zeros_(module.query)
+
+    def _sample_next_token(self, logits, temperature=1.0, top_k=None):
+        if temperature < 0.0:
+            raise ValueError("temperature must be non-negative")
+        if top_k is not None and top_k < 1:
+            raise ValueError("top_k must be >= 1 when set")
+
+        if temperature == 0.0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+        logits = logits / temperature
+
+        if top_k is not None:
+            top_k = min(top_k, logits.size(-1))
+            v, _ = torch.topk(logits, top_k)
+            logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
+
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
     
     def forward(self, idx, past_kv=None, use_cache=False, cu_doc_len=None, max_doc_len=None):
         _, T = idx.size()
@@ -633,33 +654,25 @@ class OBPM(nn.Module):
         if max_context is None:
             max_context = self.config.block_size
 
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if max_context < 1:
+            raise ValueError("max_context must be >= 1")
+
         if T > max_context:
             idx = idx[:, -max_context:]
             T = idx.size(1)
 
-        if self.use_attnres:
+        if self.use_attnres or idx.size(1) + max_new_tokens > max_context:
+            generated = idx
             for _ in range(max_new_tokens):
-                idx_cond = idx[:, -max_context:]
+                idx_cond = generated[:, -max_context:]
                 logits = self(idx_cond)
                 logits = logits[:, -1, :]
+                next_token = self._sample_next_token(logits, temperature=temperature, top_k=top_k)
+                generated = torch.cat((generated, next_token), dim=1)
 
-                if temperature == 0.0:
-                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
-                else:
-                    logits = logits / temperature
-
-                    if top_k is not None:
-                        v, _ = torch.topk(logits, top_k)
-                        logits[logits < v[:, [-1]]] = float("-inf")
-
-                    probs = F.softmax(logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, next_token), dim=1)
-
-                if idx.size(1) > max_context:
-                    idx = idx[:, -max_context:]
-
-            return idx
+            return generated
 
         past_kv = None
 
@@ -675,21 +688,7 @@ class OBPM(nn.Module):
             idx_cond = idx[:, -1:] if idx.size(1) > 0 else idx
             logits, past_kv = self(idx_cond, past_kv=past_kv, use_cache=True)
             logits = logits[:, -1, :]
-
-            if temperature == 0.0:
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
-            else:
-                logits = logits / temperature
-
-                if top_k is not None:
-                    v, _ = torch.topk(logits, top_k)
-                    logits[logits < v[:, [-1]]] = float("-inf")
-
-                probs = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
+            next_token = self._sample_next_token(logits, temperature=temperature, top_k=top_k)
             idx = torch.cat((idx, next_token), dim=1)
-
-            if idx.size(1) > max_context:
-                idx = idx[:, -max_context:]
 
         return idx

@@ -41,6 +41,7 @@ eval_only = False
 save_checkpoint = True
 ckpt_interval = 10000
 save_ckpt_at_end = True
+interactive_after_train = False
 init_from = 'scratch'
 ckpt_file_name = ''
 # wandb logging
@@ -128,6 +129,12 @@ def _str_to_bool(value):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train OBPM.")
+    parser.add_argument("--eval_only", type=_str_to_bool, nargs="?", const=True, default=eval_only)
+    parser.add_argument("--no-eval_only", dest="eval_only", action="store_false")
+    parser.add_argument("--wandb_log", type=_str_to_bool, nargs="?", const=True, default=wandb_log)
+    parser.add_argument("--no-wandb_log", dest="wandb_log", action="store_false")
+    parser.add_argument("--use_doc_masking", type=_str_to_bool, nargs="?", const=True, default=use_doc_masking)
+    parser.add_argument("--no-use_doc_masking", dest="use_doc_masking", action="store_false")
     parser.add_argument("--use_attnres", type=_str_to_bool, nargs="?", const=True, default=use_attnres)
     parser.add_argument("--no-use_attnres", dest="use_attnres", action="store_false")
     parser.add_argument("--attnres_type", choices=("full", "block"), default=attnres_type)
@@ -136,10 +143,15 @@ def parse_args():
     parser.add_argument("--no-use_lrid", dest="use_lrid", action="store_false")
     parser.add_argument("--lrid_rank", type=int, default=lrid_rank)
     parser.add_argument("--lrid_init", choices=("zero_query", "zero_key", "zero_both", "normal"), default=lrid_init)
+    parser.add_argument("--interactive_after_train", type=_str_to_bool, nargs="?", const=True, default=interactive_after_train)
+    parser.add_argument("--no-interactive_after_train", dest="interactive_after_train", action="store_false")
     return parser.parse_args()
 
 
 args = parse_args()
+eval_only = args.eval_only
+wandb_log = args.wandb_log
+use_doc_masking = args.use_doc_masking
 use_attnres = args.use_attnres
 attnres_type = args.attnres_type
 attnres_num_blocks = args.attnres_num_blocks
@@ -148,10 +160,12 @@ lrid_rank = args.lrid_rank
 lrid_init = args.lrid_init
 if use_lrid:
     use_attnres = True
+interactive_after_train = args.interactive_after_train
 
 config = get_config(sys.modules[__name__].__dict__)
 start_step, checkpoint, model, model_config = get_model(config, device)
-model.to_mixed_precision(dtype=torch.bfloat16)
+if device.type == "cuda":
+    model.to_mixed_precision(dtype=torch.bfloat16)
 # -----------------------------------------------------------------------------
 
 model = torch.compile(model)
@@ -213,7 +227,7 @@ def estimate_loss(current_step):
     model.eval()
 
     for split, loader in [("train", train_loader), ("val", val_loader)]:
-        losses = torch.zeros(eval_steps)
+        losses = []
         eval_iter = iter(loader)
 
         for k in range(eval_steps):
@@ -242,9 +256,11 @@ def estimate_loss(current_step):
             logits_for_loss = logits.float()
             loss = criterion(logits_for_loss.view(-1, logits_for_loss.size(-1)), y.view(-1))
 
-            losses[k] = float(loss.item())
+            losses.append(float(loss.item()))
 
-        out[split] = losses.mean()
+        if not losses:
+            raise RuntimeError(f"No batches available while estimating {split} loss.")
+        out[split] = sum(losses) / len(losses)
     model.train()
     return out
 
@@ -334,7 +350,7 @@ while tokens_processed < max_tokens and step < max_steps:
 
     tokens_processed += tokens_per_step
 
-    if device == "cuda": torch.cuda.synchronize()
+    if device.type == "cuda": torch.cuda.synchronize()
     t1 = time.time()
 
     tokens_per_s = tokens_per_step / (t1 - t0)
@@ -367,29 +383,31 @@ print("=" * 80)
 
 if wandb_log: logger.finish()
 
-enc = tiktoken.get_encoding("gpt2")
+if interactive_after_train and sys.stdin.isatty():
+    enc = tiktoken.get_encoding("gpt2")
 
-with torch.no_grad():
-    print("\nInteractive generation mode. Type your prompt and press Enter.")
-    print("Type 'quit' or press Ctrl-C to exit.\n")
-    while True:
-        try:
-            text = input(">>> ")
-            if text.strip().lower() in {"quit", "exit", "q"}:
+    with torch.inference_mode():
+        print("\nInteractive generation mode. Type your prompt and press Enter.")
+        print("Type 'quit' or press Ctrl-C to exit.\n")
+        while True:
+            try:
+                text = input(">>> ")
+                if text.strip().lower() in {"quit", "exit", "q"}:
+                    break
+
+                tokens = enc.encode(text)
+                if not tokens:
+                    continue
+
+                x0 = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+                max_new_tokens = max(1, block_size - len(tokens))
+                out_tokens = model.generate(x0, max_new_tokens=max_new_tokens, top_k=5)[0].tolist()
+                print(enc.decode(out_tokens))
+                print("-" * 80)
+
+            except KeyboardInterrupt:
+                print("\nExiting generation mode.")
                 break
-
-            tokens = enc.encode(text)
-            if not tokens:
-                continue
-
-            x0 = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
-
-            out_tokens = model.generate(x0, max_new_tokens=block_size-len(text), top_k=5)[0].tolist()
-            print(enc.decode(out_tokens))
-            print("-" * 80)
-
-        except KeyboardInterrupt:
-            print("\nExiting generation mode.")
-            break
-        except Exception as e:
-            print(f"Generation error: {e}")
+            except Exception as e:
+                print(f"Generation error: {e}")
