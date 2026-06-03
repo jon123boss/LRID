@@ -73,7 +73,7 @@ def get_model(config, device):
             attnres_num_blocks = config["attnres_num_blocks"],
             use_lrid = config["use_lrid"],
             lrid_rank = config["lrid_rank"],
-            lrid_init = config["lrid_init"],
+            lrid_use_logit_scale = config["lrid_use_logit_scale"],
             lrid_logit_scale = config["lrid_logit_scale"],
             )
         model = OBPM(model_config)

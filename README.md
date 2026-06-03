@@ -26,15 +26,18 @@ Download and preprocess the GPT-2 tokenized FinewebEDU10B dataset:
 python prepdata.py
 ```
 
-## LRID Attention Residuals
+## LR AttnRes
 
-LRID can be enabled as a block Attention Residuals variant:
+LR AttnRes can be enabled as a block Attention Residuals variant:
 
 ```bash
 python train.py --use_lrid --attnres_type block --lrid_rank 64
 ```
 
-`--use_lrid` automatically enables `use_attnres`. The default `--lrid_init zero_query`
-keeps step-0 depth weights uniform while leaving key projections trainable; `zero_both`
-is available for exact spec experiments but is not recommended because it blocks
-query/key gradient flow at initialization.
+`--use_lrid` automatically enables `use_attnres`. LR AttnRes uses the same learned,
+input-independent depth queries as normal Attention Residuals, but routes over
+low-rank input-dependent source keys. Logit scaling defaults to `1 / sqrt(lrid_rank)`;
+disable it with `--no-lrid_logit_scale` or set it explicitly with `--lrid_logit_scale`.
+
+See [LR_ATTNRES.md](LR_ATTNRES.md) for the full design note, parameter cost,
+stability rationale, and experiment matrix.
